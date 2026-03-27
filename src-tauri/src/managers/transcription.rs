@@ -5,10 +5,14 @@ use crate::settings::{
     get_settings, ModelUnloadTimeout, OrtAcceleratorSetting, WhisperAcceleratorSetting,
 };
 use anyhow::Result;
+use libc::c_int;
 use log::{debug, error, info, warn};
 use serde::Serialize;
 use specta::Type;
+use std::ffi::{CStr, CString};
+use std::os::raw::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
@@ -43,6 +47,48 @@ enum LoadedEngine {
     SenseVoice(SenseVoiceModel),
     GigaAM(GigaAMModel),
     Canary(CanaryModel),
+    QwenAsr(QwenAsrEngine),
+}
+
+struct QwenAsrEngine {
+    model_dir: PathBuf,
+    ctx: *mut qwen_ctx_t,
+}
+
+impl Drop for QwenAsrEngine {
+    fn drop(&mut self) {
+        #[cfg(not(target_os = "windows"))]
+        {
+            if !self.ctx.is_null() {
+                // SAFETY: ctx comes from qwen_load and is uniquely owned here.
+                unsafe { qwen_free(self.ctx) };
+                self.ctx = std::ptr::null_mut();
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+unsafe impl Send for QwenAsrEngine {}
+#[cfg(not(target_os = "windows"))]
+unsafe impl Sync for QwenAsrEngine {}
+
+#[allow(non_camel_case_types)]
+type qwen_ctx_t = std::ffi::c_void;
+
+#[cfg(not(target_os = "windows"))]
+unsafe extern "C" {
+    fn qwen_load(model_dir: *const c_char) -> *mut qwen_ctx_t;
+    fn qwen_free(ctx: *mut qwen_ctx_t);
+    fn qwen_transcribe_audio(
+        ctx: *mut qwen_ctx_t,
+        samples: *const f32,
+        n_samples: c_int,
+    ) -> *mut c_char;
+    fn qwen_set_force_language(ctx: *mut qwen_ctx_t, language: *const c_char) -> c_int;
+    fn qwen_get_num_cpus() -> c_int;
+    fn qwen_set_threads(n: c_int);
+    static mut qwen_verbose: c_int;
 }
 
 /// RAII guard that clears the `is_loading` flag and notifies waiters on drop.
@@ -282,8 +328,6 @@ impl TranscriptionManager {
             return Err(anyhow::anyhow!(error_msg));
         }
 
-        let model_path = self.model_manager.get_model_path(model_id)?;
-
         // Create appropriate engine based on model type
         let emit_loading_failed = |error_msg: &str| {
             let _ = self.app_handle.emit(
@@ -299,6 +343,7 @@ impl TranscriptionManager {
 
         let loaded_engine = match model_info.engine_type {
             EngineType::Whisper => {
+                let model_path = self.model_manager.get_model_path(model_id)?;
                 let engine = WhisperEngine::load(&model_path).map_err(|e| {
                     let error_msg = format!("Failed to load whisper model {}: {}", model_id, e);
                     emit_loading_failed(&error_msg);
@@ -307,6 +352,7 @@ impl TranscriptionManager {
                 LoadedEngine::Whisper(engine)
             }
             EngineType::Parakeet => {
+                let model_path = self.model_manager.get_model_path(model_id)?;
                 let engine =
                     ParakeetModel::load(&model_path, &Quantization::Int8).map_err(|e| {
                         let error_msg =
@@ -317,6 +363,7 @@ impl TranscriptionManager {
                 LoadedEngine::Parakeet(engine)
             }
             EngineType::Moonshine => {
+                let model_path = self.model_manager.get_model_path(model_id)?;
                 let engine = MoonshineModel::load(
                     &model_path,
                     MoonshineVariant::Base,
@@ -330,6 +377,7 @@ impl TranscriptionManager {
                 LoadedEngine::Moonshine(engine)
             }
             EngineType::MoonshineStreaming => {
+                let model_path = self.model_manager.get_model_path(model_id)?;
                 let engine = StreamingModel::load(&model_path, 0, &Quantization::default())
                     .map_err(|e| {
                         let error_msg = format!(
@@ -342,6 +390,7 @@ impl TranscriptionManager {
                 LoadedEngine::MoonshineStreaming(engine)
             }
             EngineType::SenseVoice => {
+                let model_path = self.model_manager.get_model_path(model_id)?;
                 let engine =
                     SenseVoiceModel::load(&model_path, &Quantization::Int8).map_err(|e| {
                         let error_msg =
@@ -352,6 +401,7 @@ impl TranscriptionManager {
                 LoadedEngine::SenseVoice(engine)
             }
             EngineType::GigaAM => {
+                let model_path = self.model_manager.get_model_path(model_id)?;
                 let engine = GigaAMModel::load(&model_path, &Quantization::Int8).map_err(|e| {
                     let error_msg = format!("Failed to load gigaam model {}: {}", model_id, e);
                     emit_loading_failed(&error_msg);
@@ -360,12 +410,21 @@ impl TranscriptionManager {
                 LoadedEngine::GigaAM(engine)
             }
             EngineType::Canary => {
+                let model_path = self.model_manager.get_model_path(model_id)?;
                 let engine = CanaryModel::load(&model_path, &Quantization::Int8).map_err(|e| {
                     let error_msg = format!("Failed to load canary model {}: {}", model_id, e);
                     emit_loading_failed(&error_msg);
                     anyhow::anyhow!(error_msg)
                 })?;
                 LoadedEngine::Canary(engine)
+            }
+            EngineType::QwenAsr => {
+                let engine = self.load_qwen_engine().map_err(|e| {
+                    let error_msg = format!("Failed to load qwen3-asr runtime: {}", e);
+                    emit_loading_failed(&error_msg);
+                    anyhow::anyhow!(error_msg)
+                })?;
+                LoadedEngine::QwenAsr(engine)
             }
         };
 
@@ -514,7 +573,7 @@ impl TranscriptionManager {
             drop(engine_guard);
 
             let transcribe_result = catch_unwind(AssertUnwindSafe(
-                || -> Result<transcribe_rs::TranscriptionResult> {
+                || -> Result<String> {
                     match &mut engine {
                         LoadedEngine::Whisper(whisper_engine) => {
                             let whisper_language = if validated_language == "auto" {
@@ -543,6 +602,7 @@ impl TranscriptionManager {
 
                             whisper_engine
                                 .transcribe_with(&audio, &params)
+                                .map(|r| r.text)
                                 .map_err(|e| anyhow::anyhow!("Whisper transcription failed: {}", e))
                         }
                         LoadedEngine::Parakeet(parakeet_engine) => {
@@ -552,15 +612,18 @@ impl TranscriptionManager {
                             };
                             parakeet_engine
                                 .transcribe_with(&audio, &params)
+                                .map(|r| r.text)
                                 .map_err(|e| {
                                     anyhow::anyhow!("Parakeet transcription failed: {}", e)
                                 })
                         }
                         LoadedEngine::Moonshine(moonshine_engine) => moonshine_engine
                             .transcribe(&audio, &TranscribeOptions::default())
+                            .map(|r| r.text)
                             .map_err(|e| anyhow::anyhow!("Moonshine transcription failed: {}", e)),
                         LoadedEngine::MoonshineStreaming(streaming_engine) => streaming_engine
                             .transcribe(&audio, &TranscribeOptions::default())
+                            .map(|r| r.text)
                             .map_err(|e| {
                                 anyhow::anyhow!("Moonshine streaming transcription failed: {}", e)
                             }),
@@ -579,12 +642,14 @@ impl TranscriptionManager {
                             };
                             sense_voice_engine
                                 .transcribe_with(&audio, &params)
+                                .map(|r| r.text)
                                 .map_err(|e| {
                                     anyhow::anyhow!("SenseVoice transcription failed: {}", e)
                                 })
                         }
                         LoadedEngine::GigaAM(gigaam_engine) => gigaam_engine
                             .transcribe(&audio, &TranscribeOptions::default())
+                            .map(|r| r.text)
                             .map_err(|e| anyhow::anyhow!("GigaAM transcription failed: {}", e)),
                         LoadedEngine::Canary(canary_engine) => {
                             let lang = if validated_language == "auto" {
@@ -598,8 +663,15 @@ impl TranscriptionManager {
                             };
                             canary_engine
                                 .transcribe(&audio, &options)
+                                .map(|r| r.text)
                                 .map_err(|e| anyhow::anyhow!("Canary transcription failed: {}", e))
                         }
+                        LoadedEngine::QwenAsr(qwen_engine) => Self::run_qwen_asr(
+                            &audio,
+                            qwen_engine,
+                            &validated_language,
+                        )
+                            .map_err(|e| anyhow::anyhow!("Qwen3-ASR transcription failed: {}", e)),
                     }
                 },
             ));
@@ -663,12 +735,12 @@ impl TranscriptionManager {
 
         let corrected_result = if !settings.custom_words.is_empty() && !is_whisper {
             apply_custom_words(
-                &result.text,
+                &result,
                 &settings.custom_words,
                 settings.word_correction_threshold,
             )
         } else {
-            result.text
+            result
         };
 
         // Filter out filler words and hallucinations
@@ -701,6 +773,176 @@ impl TranscriptionManager {
         self.maybe_unload_immediately("transcription");
 
         Ok(final_result)
+    }
+
+    fn load_qwen_engine(&self) -> Result<QwenAsrEngine> {
+        #[cfg(target_os = "windows")]
+        {
+            return Err(anyhow::anyhow!(
+                "qwen3-asr embedded runtime is currently unavailable on Windows"
+            ));
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            static QWEN_THREAD_POOL_INIT: OnceLock<()> = OnceLock::new();
+            static QWEN_WARMUP_DONE: OnceLock<()> = OnceLock::new();
+            let model_dir = self.model_manager.get_qwen_model_dir();
+
+            if !model_dir.is_dir() {
+                return Err(anyhow::anyhow!(
+                    "qwen3-asr model directory not found at {}. Download qwen3-asr model first.",
+                    model_dir.display()
+                ));
+            }
+
+            if !ModelManager::is_qwen_model_complete(&model_dir) {
+                return Err(anyhow::anyhow!(
+                    "qwen3-asr model files are incomplete in {}",
+                    model_dir.display()
+                ));
+            }
+
+            QWEN_THREAD_POOL_INIT.get_or_init(|| {
+                // SAFETY: qwen runtime exposes process-global thread config.
+                unsafe {
+                    let cpus = qwen_get_num_cpus();
+                    qwen_set_threads(if cpus > 0 { cpus } else { 1 });
+                }
+            });
+
+            let model_dir_cstr = CString::new(model_dir.to_string_lossy().into_owned())
+                .map_err(|_| anyhow::anyhow!("qwen3-asr model path contains NUL byte"))?;
+
+            // SAFETY: model_dir_cstr is a valid NUL-terminated path string.
+            let ctx = unsafe { qwen_load(model_dir_cstr.as_ptr()) };
+            if ctx.is_null() {
+                return Err(anyhow::anyhow!(
+                    "Failed to initialize embedded qwen-asr runtime from {}",
+                    model_dir.display()
+                ));
+            }
+
+            QWEN_WARMUP_DONE.get_or_init(|| {
+                // Best-effort warmup: primes first-run caches so the user's first real
+                // transcription has less cold-start latency.
+                let warmup_audio = vec![0.0_f32; 16_000];
+                // SAFETY: process-global verbosity flag from qwen runtime.
+                unsafe { qwen_verbose = 0 };
+                // SAFETY: ctx is valid; NULL clears forced language.
+                let _ = unsafe { qwen_set_force_language(ctx, std::ptr::null()) };
+                // SAFETY: ctx and input buffer are valid for the provided sample count.
+                let out_ptr =
+                    unsafe { qwen_transcribe_audio(ctx, warmup_audio.as_ptr(), warmup_audio.len() as c_int) };
+                if !out_ptr.is_null() {
+                    // SAFETY: qwen returns heap-allocated C string.
+                    unsafe { libc::free(out_ptr.cast()) };
+                }
+            });
+
+            Ok(QwenAsrEngine { model_dir, ctx })
+        }
+    }
+
+    fn run_qwen_asr(audio: &[f32], qwen: &QwenAsrEngine, selected_language: &str) -> Result<String> {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = (audio, qwen, selected_language);
+            return Err(anyhow::anyhow!(
+                "qwen3-asr embedded runtime is currently unavailable on Windows"
+            ));
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            if qwen.ctx.is_null() {
+                return Err(anyhow::anyhow!(
+                    "Embedded qwen-asr context is unavailable for {}",
+                    qwen.model_dir.display()
+                ));
+            }
+
+            let force_language = Self::map_qwen_language(selected_language);
+            match force_language {
+                Some(language_name) => {
+                    let lang_cstr = CString::new(language_name)
+                        .map_err(|_| anyhow::anyhow!("Invalid qwen language name"))?;
+                    // SAFETY: ctx is valid and lang_cstr is NUL-terminated.
+                    let rc = unsafe { qwen_set_force_language(qwen.ctx, lang_cstr.as_ptr()) };
+                    if rc != 0 {
+                        return Err(anyhow::anyhow!(
+                            "Failed to apply qwen language hint '{}'",
+                            language_name
+                        ));
+                    }
+                }
+                None => {
+                    // SAFETY: passing NULL clears forced language in qwen runtime.
+                    let rc = unsafe { qwen_set_force_language(qwen.ctx, std::ptr::null()) };
+                    if rc != 0 {
+                        return Err(anyhow::anyhow!("Failed to clear qwen language hint"));
+                    }
+                }
+            }
+
+            // SAFETY: qwen_verbose is a process-global integer.
+            unsafe { qwen_verbose = 0 };
+
+            // SAFETY: ctx is valid; audio pointer is valid for n_samples items.
+            let out_ptr =
+                unsafe { qwen_transcribe_audio(qwen.ctx, audio.as_ptr(), audio.len() as c_int) };
+            if out_ptr.is_null() {
+                return Err(anyhow::anyhow!(
+                    "Embedded qwen-asr transcription returned null"
+                ));
+            }
+
+            // SAFETY: out_ptr is NUL-terminated and owned by qwen runtime.
+            let text = unsafe { CStr::from_ptr(out_ptr) }
+                .to_string_lossy()
+                .trim()
+                .to_string();
+            // SAFETY: allocation originates from libc malloc-family in qwen runtime.
+            unsafe { libc::free(out_ptr.cast()) };
+            Ok(text)
+        }
+    }
+
+    fn map_qwen_language(language: &str) -> Option<&'static str> {
+        match language {
+            "auto" => None,
+            "zh" | "zh-Hans" | "zh-Hant" => Some("Chinese"),
+            "en" => Some("English"),
+            "yue" => Some("Cantonese"),
+            "ar" => Some("Arabic"),
+            "de" => Some("German"),
+            "fr" => Some("French"),
+            "es" => Some("Spanish"),
+            "pt" => Some("Portuguese"),
+            "id" => Some("Indonesian"),
+            "it" => Some("Italian"),
+            "ko" => Some("Korean"),
+            "ru" => Some("Russian"),
+            "th" => Some("Thai"),
+            "vi" => Some("Vietnamese"),
+            "ja" => Some("Japanese"),
+            "tr" => Some("Turkish"),
+            "hi" => Some("Hindi"),
+            "ms" => Some("Malay"),
+            "nl" => Some("Dutch"),
+            "sv" => Some("Swedish"),
+            "da" => Some("Danish"),
+            "fi" => Some("Finnish"),
+            "pl" => Some("Polish"),
+            "cs" => Some("Czech"),
+            "tl" => Some("Filipino"),
+            "fa" => Some("Persian"),
+            "el" => Some("Greek"),
+            "ro" => Some("Romanian"),
+            "hu" => Some("Hungarian"),
+            "mk" => Some("Macedonian"),
+            _ => None,
+        }
     }
 }
 

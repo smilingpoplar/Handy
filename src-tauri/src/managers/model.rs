@@ -26,6 +26,7 @@ pub enum EngineType {
     SenseVoice,
     GigaAM,
     Canary,
+    QwenAsr,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -93,6 +94,12 @@ pub struct ModelManager {
 }
 
 impl ModelManager {
+    const QWEN_ASR_MODEL_ID: &'static str = "qwen3-asr";
+    const QWEN_ASR_FALLBACK_MODEL_DIRNAME: &'static str = "qwen3-asr-0.6b";
+    const QWEN_MODEL_BASE_URL: &'static str =
+        "https://huggingface.co/Qwen/Qwen3-ASR-0.6B/resolve/main";
+    const QWEN_MODEL_LARGE_FILE_MIN_BYTES: u64 = 1_500_000_000;
+
     pub fn new(app_handle: &AppHandle) -> Result<Self> {
         // Create models directory in app data
         let models_dir = crate::portable::app_data_dir(app_handle)
@@ -255,6 +262,65 @@ impl ModelManager {
                 is_recommended: false,
                 supported_languages: whisper_languages,
                 supports_language_selection: true,
+                is_custom: false,
+            },
+        );
+
+        #[cfg(not(target_os = "windows"))]
+        available_models.insert(
+            "qwen3-asr".to_string(),
+            ModelInfo {
+                id: "qwen3-asr".to_string(),
+                name: "Qwen3 ASR 0.6B".to_string(),
+                description: "Embedded qwen-asr C runtime (CPU inference).".to_string(),
+                filename: "qwen3-asr-0.6b".to_string(),
+                url: None,
+                sha256: None,
+                size_mb: 1700,
+                is_downloaded: false,
+                is_downloading: false,
+                partial_size: 0,
+                is_directory: true,
+                engine_type: EngineType::QwenAsr,
+                accuracy_score: 0.80,
+                speed_score: 0.65,
+                supports_translation: false,
+                is_recommended: false,
+                supported_languages: vec![
+                    "zh".to_string(),
+                    "zh-Hans".to_string(),
+                    "zh-Hant".to_string(),
+                    "en".to_string(),
+                    "yue".to_string(),
+                    "ar".to_string(),
+                    "de".to_string(),
+                    "fr".to_string(),
+                    "es".to_string(),
+                    "pt".to_string(),
+                    "id".to_string(),
+                    "it".to_string(),
+                    "ko".to_string(),
+                    "ru".to_string(),
+                    "th".to_string(),
+                    "vi".to_string(),
+                    "ja".to_string(),
+                    "tr".to_string(),
+                    "hi".to_string(),
+                    "ms".to_string(),
+                    "nl".to_string(),
+                    "sv".to_string(),
+                    "da".to_string(),
+                    "fi".to_string(),
+                    "pl".to_string(),
+                    "cs".to_string(),
+                    "tl".to_string(),
+                    "fa".to_string(),
+                    "el".to_string(),
+                    "ro".to_string(),
+                    "hu".to_string(),
+                    "mk".to_string(),
+                ],
+                supports_language_selection: false,
                 is_custom: false,
             },
         );
@@ -612,6 +678,52 @@ impl ModelManager {
         models.get(model_id).cloned()
     }
 
+    fn qwen_model_dir_for_dirname(&self, model_dir_name: &str) -> PathBuf {
+        self.models_dir.join(model_dir_name)
+    }
+
+    pub fn get_qwen_model_dir(&self) -> PathBuf {
+        let model_dir_name = self
+            .get_model_info(Self::QWEN_ASR_MODEL_ID)
+            .map(|m| m.filename)
+            .unwrap_or_else(|| Self::QWEN_ASR_FALLBACK_MODEL_DIRNAME.to_string());
+        self.qwen_model_dir_for_dirname(&model_dir_name)
+    }
+
+    pub fn is_qwen_model_complete(model_dir: &Path) -> bool {
+        if !model_dir.is_dir() {
+            return false;
+        }
+        for file_name in Self::qwen_model_files() {
+            let path = model_dir.join(file_name);
+            if !path.is_file() {
+                return false;
+            }
+            if file_name == "model.safetensors" {
+                match path.metadata() {
+                    Ok(meta) if meta.len() >= Self::QWEN_MODEL_LARGE_FILE_MIN_BYTES => {}
+                    _ => return false,
+                }
+            }
+        }
+        true
+    }
+
+    fn is_qwen_ready_for_dirname(&self, model_dir_name: &str) -> bool {
+        let model_dir = self.qwen_model_dir_for_dirname(model_dir_name);
+        Self::is_qwen_model_complete(&model_dir)
+    }
+
+    fn qwen_model_files() -> [&'static str; 5] {
+        [
+            "config.json",
+            "generation_config.json",
+            "model.safetensors",
+            "vocab.json",
+            "merges.txt",
+        ]
+    }
+
     fn migrate_bundled_models(&self) -> Result<()> {
         // Check for bundled models and copy them to user directory
         let bundled_models = ["ggml-small.bin"]; // Add other bundled models here if any
@@ -687,6 +799,13 @@ impl ModelManager {
         let mut models = self.available_models.lock().unwrap();
 
         for model in models.values_mut() {
+            if matches!(model.engine_type, EngineType::QwenAsr) {
+                model.is_downloaded = self.is_qwen_ready_for_dirname(&model.filename);
+                model.is_downloading = false;
+                model.partial_size = 0;
+                continue;
+            }
+
             if model.is_directory {
                 // For directory-based models, check if the directory exists
                 let model_path = self.models_dir.join(&model.filename);
@@ -948,6 +1067,197 @@ impl ModelManager {
         Ok(format!("{:x}", hasher.finalize()))
     }
 
+    async fn download_qwen_model(&self, model_id: &str) -> Result<()> {
+        {
+            let mut models = self.available_models.lock().unwrap();
+            if let Some(model) = models.get_mut(model_id) {
+                model.is_downloading = true;
+            }
+        }
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        {
+            let mut flags = self.cancel_flags.lock().unwrap();
+            flags.insert(model_id.to_string(), cancel_flag.clone());
+        }
+
+        let mut cleanup = DownloadCleanup {
+            available_models: &self.available_models,
+            cancel_flags: &self.cancel_flags,
+            model_id: model_id.to_string(),
+            disarmed: false,
+        };
+
+        let model_dir = self.get_qwen_model_dir();
+        fs::create_dir_all(&model_dir)?;
+
+        struct QwenFileDownload {
+            file_name: &'static str,
+            dest: PathBuf,
+            partial: PathBuf,
+            url: String,
+            resume_from: u64,
+            planned_total: u64,
+        }
+
+        let client = reqwest::Client::new();
+        let mut downloaded_total: u64 = 0;
+        let mut expected_total: u64 = 0;
+        let mut files = Vec::new();
+        let mut last_emit = Instant::now();
+        let throttle_duration = Duration::from_millis(100);
+
+        for file_name in Self::qwen_model_files() {
+            if cancel_flag.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+
+            let dest = model_dir.join(file_name);
+            let partial = model_dir.join(format!("{}.partial", file_name));
+            let url = format!("{}/{}", Self::QWEN_MODEL_BASE_URL, file_name);
+
+            if dest.exists() {
+                let size = dest.metadata()?.len();
+                if file_name != "model.safetensors" || size >= Self::QWEN_MODEL_LARGE_FILE_MIN_BYTES
+                {
+                    expected_total = expected_total.saturating_add(size);
+                    downloaded_total += size;
+                    continue;
+                }
+            }
+
+            let resume_from = if partial.exists() {
+                partial.metadata()?.len()
+            } else {
+                0
+            };
+            downloaded_total = downloaded_total.saturating_add(resume_from);
+
+            // Avoid preflight HEAD requests so cancellation stays responsive.
+            // We'll refine planned_total from GET response headers below.
+            let planned_total = resume_from;
+            expected_total = expected_total.saturating_add(planned_total);
+
+            files.push(QwenFileDownload {
+                file_name,
+                dest,
+                partial,
+                url,
+                resume_from,
+                planned_total,
+            });
+        }
+
+        for file in &mut files {
+            if cancel_flag.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+
+            let mut request = client.get(&file.url);
+            if file.resume_from > 0 {
+                request = request.header("Range", format!("bytes={}-", file.resume_from));
+            }
+
+            let mut response = request.send().await?;
+            if file.resume_from > 0 && response.status() == reqwest::StatusCode::OK {
+                let _ = fs::remove_file(&file.partial);
+                downloaded_total = downloaded_total.saturating_sub(file.resume_from);
+                expected_total = expected_total.saturating_sub(file.planned_total);
+                file.resume_from = 0;
+                file.planned_total = 0;
+                response = client.get(&file.url).send().await?;
+            }
+
+            if !response.status().is_success()
+                && response.status() != reqwest::StatusCode::PARTIAL_CONTENT
+            {
+                return Err(anyhow::anyhow!(
+                    "Failed to download qwen file {}: HTTP {}",
+                    file.file_name,
+                    response.status()
+                ));
+            }
+
+            if let Some(content_len) = response.content_length() {
+                let file_total = file.resume_from.saturating_add(content_len);
+                if file_total > file.planned_total {
+                    expected_total =
+                        expected_total.saturating_add(file_total.saturating_sub(file.planned_total));
+                    file.planned_total = file_total;
+                }
+            }
+
+            let mut output_file = if file.resume_from > 0 {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&file.partial)?
+            } else {
+                std::fs::File::create(&file.partial)?
+            };
+
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                let chunk = chunk?;
+                output_file.write_all(&chunk)?;
+                downloaded_total = downloaded_total.saturating_add(chunk.len() as u64);
+
+                if last_emit.elapsed() >= throttle_duration {
+                    let _ = self.app_handle.emit(
+                        "model-download-progress",
+                        DownloadProgress {
+                            model_id: model_id.to_string(),
+                            downloaded: downloaded_total,
+                            total: expected_total.max(downloaded_total),
+                            percentage: if expected_total > 0 {
+                                (downloaded_total as f64 / expected_total as f64) * 100.0
+                            } else {
+                                0.0
+                            },
+                        },
+                    );
+                    last_emit = Instant::now();
+                }
+            }
+
+            output_file.flush()?;
+            drop(output_file);
+            fs::rename(&file.partial, &file.dest)?;
+        }
+
+        let qwen_ready = Self::is_qwen_model_complete(&model_dir);
+        if !qwen_ready {
+            return Err(anyhow::anyhow!(
+                "qwen3-asr download completed but runtime files are incomplete"
+            ));
+        }
+
+        cleanup.disarmed = true;
+        {
+            let mut models = self.available_models.lock().unwrap();
+            if let Some(model) = models.get_mut(model_id) {
+                model.is_downloading = false;
+                model.is_downloaded = qwen_ready;
+                model.partial_size = 0;
+            }
+        }
+        self.cancel_flags.lock().unwrap().remove(model_id);
+        let _ = self.app_handle.emit(
+            "model-download-progress",
+            DownloadProgress {
+                model_id: model_id.to_string(),
+                downloaded: downloaded_total,
+                total: downloaded_total,
+                percentage: 100.0,
+            },
+        );
+        let _ = self.app_handle.emit("model-download-complete", model_id);
+        Ok(())
+    }
+
     pub async fn download_model(&self, model_id: &str) -> Result<()> {
         let model_info = {
             let models = self.available_models.lock().unwrap();
@@ -956,6 +1266,10 @@ impl ModelManager {
 
         let model_info =
             model_info.ok_or_else(|| anyhow::anyhow!("Model not found: {}", model_id))?;
+
+        if matches!(model_info.engine_type, EngineType::QwenAsr) {
+            return self.download_qwen_model(model_id).await;
+        }
 
         let url = model_info
             .url
@@ -1310,7 +1624,13 @@ impl ModelManager {
 
         let mut deleted_something = false;
 
-        if model_info.is_directory {
+        if matches!(model_info.engine_type, EngineType::QwenAsr) {
+            let qwen_model_dir = self.get_qwen_model_dir();
+            if qwen_model_dir.exists() {
+                fs::remove_dir_all(&qwen_model_dir)?;
+                deleted_something = true;
+            }
+        } else if model_info.is_directory {
             // Delete complete model directory if it exists
             if model_path.exists() && model_path.is_dir() {
                 info!("Deleting model directory at: {:?}", model_path);
@@ -1380,7 +1700,17 @@ impl ModelManager {
             .models_dir
             .join(format!("{}.partial", &model_info.filename));
 
-        if model_info.is_directory {
+        if matches!(model_info.engine_type, EngineType::QwenAsr) {
+            let qwen_model_dir = self.get_qwen_model_dir();
+            if qwen_model_dir.exists() && !partial_path.exists() {
+                Ok(qwen_model_dir)
+            } else {
+                Err(anyhow::anyhow!(
+                    "Complete qwen3-asr model directory not found: {}",
+                    model_id
+                ))
+            }
+        } else if model_info.is_directory {
             // For directory-based models, ensure the directory exists and is complete
             if model_path.exists() && model_path.is_dir() && !partial_path.exists() {
                 Ok(model_path)

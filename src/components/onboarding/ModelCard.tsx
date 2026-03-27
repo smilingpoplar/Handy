@@ -240,16 +240,17 @@ const ModelCard: React.FC<ModelCardProps> = ({
       {/* Download/extract progress */}
       {status === "downloading" && downloadProgress !== undefined && (
         <div className="w-full mt-3">
-          <div className="w-full h-1.5 bg-mid-gray/20 rounded-full overflow-hidden">
-            <div
-              className="h-full bg-logo-primary rounded-full transition-all duration-300"
-              style={{ width: `${downloadProgress}%` }}
-            />
-          </div>
+          <progress
+            value={Math.max(0, Math.min(100, downloadProgress))}
+            max={100}
+            className="w-full h-1.5 [&::-webkit-progress-bar]:rounded-full [&::-webkit-progress-bar]:bg-mid-gray/20 [&::-webkit-progress-value]:rounded-full [&::-webkit-progress-value]:bg-logo-primary"
+          />
           <div className="flex items-center justify-between text-xs mt-1">
             <span className="text-text/50">
               {t("modelSelector.downloading", {
-                percentage: Math.round(downloadProgress),
+                percentage: Math.round(
+                  Math.max(0, Math.min(100, downloadProgress)),
+                ),
               })}
             </span>
             <div className="flex items-center gap-2">

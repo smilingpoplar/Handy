@@ -165,6 +165,19 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     app_handle.manage(transcription_manager.clone());
     app_handle.manage(history_manager.clone());
 
+    // Preload the selected model on app startup so the first transcription
+    // does not pay full cold-start latency during recording.
+    let startup_settings = settings::get_settings(app_handle);
+    if startup_settings.model_unload_timeout != settings::ModelUnloadTimeout::Immediately {
+        let should_preload = model_manager
+            .get_model_info(&startup_settings.selected_model)
+            .map(|m| m.is_downloaded)
+            .unwrap_or(false);
+        if should_preload {
+            transcription_manager.initiate_model_load();
+        }
+    }
+
     // Note: Shortcuts are NOT initialized here.
     // The frontend is responsible for calling the `initialize_shortcuts` command
     // after permissions are confirmed (on macOS) or after onboarding completes.

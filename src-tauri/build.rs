@@ -2,9 +2,67 @@ fn main() {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     build_apple_intelligence_bridge();
 
+    #[cfg(not(target_os = "windows"))]
+    build_qwen_asr_bridge();
+
     generate_tray_translations();
 
     tauri_build::build()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn build_qwen_asr_bridge() {
+    let qwen_dir = std::path::Path::new("c/qwen-asr");
+    let files = [
+        "qwen_asr.c",
+        "qwen_asr_audio.c",
+        "qwen_asr_decoder.c",
+        "qwen_asr_encoder.c",
+        "qwen_asr_kernels.c",
+        "qwen_asr_kernels_avx.c",
+        "qwen_asr_kernels_generic.c",
+        "qwen_asr_kernels_neon.c",
+        "qwen_asr_safetensors.c",
+        "qwen_asr_tokenizer.c",
+    ];
+
+    for file in files {
+        println!("cargo:rerun-if-changed={}", qwen_dir.join(file).display());
+    }
+    println!(
+        "cargo:rerun-if-changed={}",
+        qwen_dir.join("qwen_asr.h").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        qwen_dir.join("qwen_asr_kernels.h").display()
+    );
+
+    let mut build = cc::Build::new();
+    build
+        .include(qwen_dir)
+        .warnings(false)
+        .define("_GNU_SOURCE", None)
+        .flag_if_supported("-std=c11")
+        .flag_if_supported("-O3")
+        .flag_if_supported("-ffast-math");
+
+    #[cfg(target_os = "macos")]
+    {
+        // Match tnt-asr's fast path (`make blas`) on macOS.
+        build.define("USE_BLAS", None);
+        build.define("ACCELERATE_NEW_LAPACK", None);
+        println!("cargo:rustc-link-lib=framework=Accelerate");
+    }
+
+    for file in files {
+        build.file(qwen_dir.join(file));
+    }
+
+    build.compile("qwen_asr");
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    println!("cargo:rustc-link-lib=m");
 }
 
 /// Generate tray menu translations from frontend locale files.
