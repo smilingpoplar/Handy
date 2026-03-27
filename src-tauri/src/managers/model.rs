@@ -1,3 +1,7 @@
+use crate::managers::qwen3_engine::{
+    build_qwen3_file_url, init_qwen3_python_path, resolve_qwen3_model_info,
+    QWEN3_DEFAULT_ENDPOINT,
+};
 use crate::settings::{get_settings, write_settings};
 use anyhow::Result;
 use flate2::read::GzDecoder;
@@ -26,6 +30,7 @@ pub enum EngineType {
     SenseVoice,
     GigaAM,
     Canary,
+    Qwen3,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -57,6 +62,23 @@ pub struct DownloadProgress {
     pub downloaded: u64,
     pub total: u64,
     pub percentage: f64,
+}
+
+struct FileDownloadResult {
+    downloaded: u64,
+    total: u64,
+    cancelled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct Qwen3DownloadManifestFile {
+    filename: String,
+    size: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct Qwen3DownloadManifest {
+    files: Vec<Qwen3DownloadManifestFile>,
 }
 
 /// RAII guard that cleans up download state (`is_downloading` flag and cancel flag)
@@ -93,6 +115,90 @@ pub struct ModelManager {
 }
 
 impl ModelManager {
+    fn find_file_recursive(dir: &Path, predicate: &impl Fn(&Path) -> bool) -> bool {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return false,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+
+            if file_type.is_file() {
+                if predicate(&path) {
+                    return true;
+                }
+            } else if file_type.is_dir() && Self::find_file_recursive(&path, predicate) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn is_qwen3_model_dir_complete(model_dir: &Path) -> bool {
+        if !model_dir.exists() || !model_dir.is_dir() {
+            return false;
+        }
+
+        let manifest_path = model_dir.join(".download-manifest.json");
+        if manifest_path.exists() {
+            let manifest_ok = (|| -> Result<bool> {
+                let manifest_content = fs::read_to_string(&manifest_path)?;
+                let manifest: Qwen3DownloadManifest = serde_json::from_str(&manifest_content)?;
+                if manifest.files.is_empty() {
+                    return Ok(false);
+                }
+
+                for file in manifest.files {
+                    let file_path = model_dir.join(&file.filename);
+                    if !file_path.exists() || !file_path.is_file() {
+                        return Ok(false);
+                    }
+                    if file.size > 0 {
+                        let actual = file_path.metadata()?.len();
+                        if actual < file.size {
+                            return Ok(false);
+                        }
+                    }
+                }
+                Ok(true)
+            })();
+
+            if let Ok(true) = manifest_ok {
+                return true;
+            }
+        }
+
+        // Legacy fallback for old downloads without manifest.
+        let has_config = Self::find_file_recursive(model_dir, &|p| {
+            p.file_name().and_then(|n| n.to_str()) == Some("config.json")
+        });
+        let has_tokenizer_json = Self::find_file_recursive(model_dir, &|p| {
+            p.file_name().and_then(|n| n.to_str()) == Some("tokenizer.json")
+        });
+        let has_tokenizer_config = Self::find_file_recursive(model_dir, &|p| {
+            p.file_name().and_then(|n| n.to_str()) == Some("tokenizer_config.json")
+        });
+        let has_vocab = Self::find_file_recursive(model_dir, &|p| {
+            p.file_name().and_then(|n| n.to_str()) == Some("vocab.json")
+        });
+        let has_merges = Self::find_file_recursive(model_dir, &|p| {
+            p.file_name().and_then(|n| n.to_str()) == Some("merges.txt")
+        });
+        let has_weights = Self::find_file_recursive(model_dir, &|p| {
+            p.extension().and_then(|ext| ext.to_str()) == Some("safetensors")
+        });
+
+        let has_tokenizer_assets =
+            has_tokenizer_json || (has_tokenizer_config && has_vocab && has_merges);
+
+        has_config && has_tokenizer_assets && has_weights
+    }
+
     pub fn new(app_handle: &AppHandle) -> Result<Self> {
         // Create models directory in app data
         let models_dir = crate::portable::app_data_dir(app_handle)
@@ -253,11 +359,78 @@ impl ModelManager {
                 speed_score: 0.35,
                 supports_translation: false,
                 is_recommended: false,
-                supported_languages: whisper_languages,
+                supported_languages: whisper_languages.clone(),
                 supports_language_selection: true,
                 is_custom: false,
             },
         );
+
+        // Qwen3 language support mirrors qwen3_asr_server.py lang_map.
+        let qwen3_languages: Vec<String> = vec![
+            "zh", "zh-Hans", "zh-Hant", "yue", "en", "ja", "ko", "es", "fr", "de", "it", "pt",
+            "ru", "ar", "hi", "th", "vi", "tr", "pl", "nl", "sv", "da", "fi", "cs", "el", "ro",
+            "hu",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        // Qwen3 ASR model (Apple Silicon macOS only, MLX-based)
+        // Model files are managed by mlx-audio cache rather than app_data/models.
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            available_models.insert(
+                "qwen3-asr".to_string(),
+                ModelInfo {
+                    id: "qwen3-asr".to_string(),
+                    name: "Qwen3-ASR-0.6B-8bit (MLX)".to_string(),
+                    description:
+                        "MLX backend, 0.6B model, 8-bit quantized. Multilingual ASR.".to_string(),
+                    filename: "qwen3-asr".to_string(),
+                    url: Some("mlx://mlx-community/Qwen3-ASR-0.6B-8bit".to_string()),
+                    sha256: None,
+                    size_mb: 600,
+                    is_downloaded: false,
+                    is_downloading: false,
+                    partial_size: 0,
+                    is_directory: false,
+                    engine_type: EngineType::Qwen3,
+                    accuracy_score: 0.90,
+                    speed_score: 0.85,
+                    supports_translation: false,
+                    is_recommended: false,
+                    supported_languages: qwen3_languages.clone(),
+                    supports_language_selection: true,
+                    is_custom: false,
+                },
+            );
+
+            available_models.insert(
+                "qwen3-asr-1.7b".to_string(),
+                ModelInfo {
+                    id: "qwen3-asr-1.7b".to_string(),
+                    name: "Qwen3-ASR-1.7B-8bit (MLX)".to_string(),
+                    description:
+                        "MLX backend, 1.7B model, 8-bit quantized. Higher accuracy multilingual ASR."
+                            .to_string(),
+                    filename: "qwen3-asr-1.7b".to_string(),
+                    url: Some("mlx://mlx-community/Qwen3-ASR-1.7B-8bit".to_string()),
+                    sha256: None,
+                    size_mb: 1700,
+                    is_downloaded: false,
+                    is_downloading: false,
+                    partial_size: 0,
+                    is_directory: false,
+                    engine_type: EngineType::Qwen3,
+                    accuracy_score: 0.94,
+                    speed_score: 0.65,
+                    supports_translation: false,
+                    is_recommended: false,
+                    supported_languages: qwen3_languages.clone(),
+                    supports_language_selection: true,
+                    is_custom: false,
+                },
+            );
+        }
 
         // Add NVIDIA Parakeet models (directory-based)
         available_models.insert(
@@ -684,9 +857,40 @@ impl ModelManager {
     }
 
     fn update_download_status(&self) -> Result<()> {
+        // Collect mlx model ids + names while holding the lock, then compute cache status
+        // after releasing the lock to avoid re-locking `available_models`.
+        let mlx_models: Vec<(String, String)> = {
+            let models = self.available_models.lock().unwrap();
+            models
+                .values()
+                .filter_map(|m| {
+                    let url = m.url.as_ref()?;
+                    let mlx_model_name = url.strip_prefix("mlx://")?;
+                    Some((m.id.clone(), mlx_model_name.to_string()))
+                })
+                .collect()
+        };
+        let mlx_models_status: HashMap<String, bool> = mlx_models
+            .into_iter()
+            .map(|(model_id, mlx_model_name)| {
+                let model_dir = self.models_dir.join(mlx_model_name.replace("/", "--"));
+                (model_id, Self::is_qwen3_model_dir_complete(&model_dir))
+            })
+            .collect();
+
         let mut models = self.available_models.lock().unwrap();
 
         for model in models.values_mut() {
+            // Handle mlx-audio managed models (Qwen3)
+            if let Some(url) = &model.url {
+                if url.starts_with("mlx://") {
+                    model.is_downloaded = *mlx_models_status.get(&model.id).unwrap_or(&false);
+                    model.is_downloading = false;
+                    model.partial_size = 0;
+                    continue;
+                }
+            }
+
             if model.is_directory {
                 // For directory-based models, check if the directory exists
                 let model_path = self.models_dir.join(&model.filename);
@@ -948,6 +1152,462 @@ impl ModelManager {
         Ok(format!("{:x}", hasher.finalize()))
     }
 
+    fn mlx_model_name_for(&self, model_id: &str) -> Option<String> {
+        let models = self.available_models.lock().unwrap();
+        let model = models.get(model_id)?;
+        let url = model.url.as_ref()?;
+        url.strip_prefix("mlx://").map(|s| s.to_string())
+    }
+
+    fn local_mlx_model_dir(&self, model_id: &str) -> Result<PathBuf> {
+        let mlx_model_name = self
+            .mlx_model_name_for(model_id)
+            .ok_or_else(|| anyhow::anyhow!("Unknown mlx-audio model: {}", model_id))?;
+        Ok(self.models_dir.join(mlx_model_name.replace("/", "--")))
+    }
+
+    /// Check if an mlx-audio managed model is cached locally.
+    fn check_mlx_model_cached(&self, model_id: &str) -> bool {
+        let model_dir = match self.local_mlx_model_dir(model_id) {
+            Ok(path) => path,
+            Err(_) => return false,
+        };
+        Self::is_qwen3_model_dir_complete(&model_dir)
+    }
+
+    /// Delete model files from app-managed storage.
+    fn delete_mlx_model(&self, model_id: &str) -> Result<()> {
+        info!("Deleting model: {}", model_id);
+        let local_model_dir = self.local_mlx_model_dir(model_id)?;
+        if local_model_dir.exists() {
+            fs::remove_dir_all(&local_model_dir)?;
+        }
+
+        self.update_download_status()?;
+        let _ = self.app_handle.emit("model-deleted", model_id);
+        Ok(())
+    }
+
+    /// Download an mlx-audio managed model using Python mlx-audio.
+    async fn download_mlx_model(&self, model_id: &str) -> Result<()> {
+        {
+            let mut models = self.available_models.lock().unwrap();
+            if let Some(model) = models.get_mut(model_id) {
+                model.is_downloading = true;
+                model.partial_size = 0;
+            }
+        }
+
+        let prepare_result = self.ensure_qwen3_python_runtime_ready(Some(model_id));
+        if let Err(err) = prepare_result {
+            let mut models = self.available_models.lock().unwrap();
+            if let Some(model) = models.get_mut(model_id) {
+                model.is_downloading = false;
+                model.partial_size = 0;
+            }
+            return Err(err);
+        }
+
+        let mlx_model_name = self
+            .mlx_model_name_for(model_id)
+            .ok_or_else(|| anyhow::anyhow!("Unknown mlx-audio model: {}", model_id))?;
+        let local_model_dir = self.local_mlx_model_dir(model_id)?;
+
+        if self.check_mlx_model_cached(model_id) {
+            let cached_size_bytes = self
+                .get_model_info(model_id)
+                .map(|m| m.size_mb * 1024 * 1024)
+                .unwrap_or(0);
+            let mut models = self.available_models.lock().unwrap();
+            if let Some(model) = models.get_mut(model_id) {
+                model.is_downloading = false;
+                model.is_downloaded = true;
+                model.partial_size = 0;
+            }
+            let _ = self.app_handle.emit(
+                "model-download-progress",
+                DownloadProgress {
+                    model_id: model_id.to_string(),
+                    downloaded: cached_size_bytes,
+                    total: cached_size_bytes,
+                    percentage: 100.0,
+                },
+            );
+            let _ = self.app_handle.emit("model-download-complete", model_id);
+            return Ok(());
+        }
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        {
+            let mut flags = self.cancel_flags.lock().unwrap();
+            flags.insert(model_id.to_string(), cancel_flag.clone());
+        }
+
+        let mut cleanup = DownloadCleanup {
+            available_models: &self.available_models,
+            cancel_flags: &self.cancel_flags,
+            model_id: model_id.to_string(),
+            disarmed: false,
+        };
+
+        let model_plan = resolve_qwen3_model_info(&mlx_model_name)?;
+        let client = reqwest::Client::new();
+
+        let mut total_bytes = if model_plan.total > 0 {
+            model_plan.total
+        } else {
+            model_plan.files.iter().map(|f| f.size).sum()
+        };
+
+        let mut downloaded_bytes = 0u64;
+        for file in &model_plan.files {
+            let path = local_model_dir.join(&file.filename);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let existing = path.metadata().map(|m| m.len()).unwrap_or(0);
+            let expected = if file.size > 0 { file.size } else { existing };
+            downloaded_bytes += existing.min(expected);
+            if total_bytes < downloaded_bytes {
+                total_bytes = downloaded_bytes;
+            }
+        }
+
+        let emit_progress = |downloaded: u64, total: u64| {
+            let percentage = if total > 0 {
+                (downloaded as f64 / total as f64) * 100.0
+            } else {
+                0.0
+            };
+            let _ = self.app_handle.emit(
+                "model-download-progress",
+                DownloadProgress {
+                    model_id: model_id.to_string(),
+                    downloaded,
+                    total,
+                    percentage,
+                },
+            );
+        };
+
+        emit_progress(downloaded_bytes, total_bytes);
+
+        let revision = model_plan.revision.clone();
+        for file in model_plan.files {
+            let path = local_model_dir.join(&file.filename);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            let existing = path.metadata().map(|m| m.len()).unwrap_or(0);
+            let previous_expected = if file.size > 0 { file.size } else { existing };
+            let previous_counted = existing.min(previous_expected);
+
+            if file.size > 0 && existing >= file.size {
+                continue;
+            }
+
+            let url =
+                build_qwen3_file_url(QWEN3_DEFAULT_ENDPOINT, &mlx_model_name, &revision, &file.filename)?
+                    .to_string();
+
+            let result = self
+                .download_file_with_resume(&client, &url, &path, &cancel_flag, |file_downloaded, file_total| {
+                    let effective_total = if total_bytes == 0 { file_total } else { total_bytes };
+                    let aggregate_downloaded =
+                        downloaded_bytes.saturating_sub(previous_counted) + file_downloaded;
+                    let aggregate_total = effective_total.max(aggregate_downloaded);
+                    emit_progress(aggregate_downloaded.min(aggregate_total), aggregate_total);
+                })
+                .await?;
+
+            if result.cancelled {
+                info!("Download cancelled for: {}", model_id);
+                return Ok(());
+            }
+
+            if file.size > 0 {
+                let final_size = path.metadata()?.len();
+                if final_size < file.size {
+                    return Err(anyhow::anyhow!(
+                        "Incomplete file {}: expected {}, got {}",
+                        file.filename,
+                        file.size,
+                        final_size
+                    ));
+                }
+            }
+
+            let discovered_total = if file.size > 0 { file.size } else { result.total };
+            if discovered_total > previous_expected {
+                total_bytes += discovered_total - previous_expected;
+            }
+
+            downloaded_bytes = downloaded_bytes.saturating_sub(previous_counted) + result.downloaded;
+            if total_bytes < downloaded_bytes {
+                total_bytes = downloaded_bytes;
+            }
+            emit_progress(downloaded_bytes, total_bytes);
+        }
+
+        if !self.check_mlx_model_cached(model_id) {
+            return Err(anyhow::anyhow!("Model download verification failed"));
+        }
+
+        emit_progress(total_bytes, total_bytes);
+
+        cleanup.disarmed = true;
+        let mut models = self.available_models.lock().unwrap();
+        if let Some(model) = models.get_mut(model_id) {
+            model.is_downloading = false;
+            model.is_downloaded = true;
+            model.partial_size = 0;
+        }
+        self.cancel_flags.lock().unwrap().remove(model_id);
+        let _ = self.app_handle.emit("model-download-complete", model_id);
+        Ok(())
+    }
+
+    pub fn ensure_qwen3_python_runtime_ready(&self, _progress_model_id: Option<&str>) -> Result<()> {
+        init_qwen3_python_path(&self.app_handle)
+            .map_err(|e| anyhow::anyhow!("Failed to initialize Qwen3 python path: {}", e))?;
+
+        let app_data_dir = crate::portable::app_data_dir(&self.app_handle)
+            .map_err(|e| anyhow::anyhow!("Failed to get app data dir for Qwen3 runtime: {}", e))?;
+        let python_runtime_dir = app_data_dir.join("qwen3_asr_mlx");
+        let venv_dir = python_runtime_dir.join(".venv");
+        let venv_python = venv_dir.join("bin/python3");
+
+        let bundled_runtime_dir = self
+            .app_handle
+            .path()
+            .resolve("resources/qwen3_asr_mlx", tauri::path::BaseDirectory::Resource)
+            .map_err(|e| anyhow::anyhow!("Failed to resolve bundled Qwen3 runtime directory: {}", e))?;
+
+        if !bundled_runtime_dir.exists() {
+            return Err(anyhow::anyhow!(
+                "Bundled Qwen3 runtime directory not found: {}",
+                bundled_runtime_dir.display()
+            ));
+        }
+
+        // Sync bundled runtime resources into app data runtime directory.
+        Self::sync_dir_if_newer(&bundled_runtime_dir, &python_runtime_dir)?;
+
+        let uv_bin = python_runtime_dir.join("uv");
+        let uv_archive = python_runtime_dir.join("uv.tar.gz");
+        if !uv_bin.exists() {
+            if !uv_archive.exists() {
+                return Err(anyhow::anyhow!(
+                    "Bundled uv archive missing in runtime directory: {}",
+                    uv_archive.display()
+                ));
+            }
+
+            info!(
+                "Extracting uv binary from {} to {}",
+                uv_archive.display(),
+                python_runtime_dir.display()
+            );
+            let archive_file = File::open(&uv_archive)?;
+            let decoder = GzDecoder::new(archive_file);
+            let mut archive = Archive::new(decoder);
+            archive.unpack(&python_runtime_dir)?;
+        }
+
+        if !uv_bin.exists() {
+            return Err(anyhow::anyhow!(
+                "Bundled uv binary missing after extraction: {}",
+                uv_bin.display()
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&uv_bin)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&uv_bin, perms)?;
+        }
+
+        if !venv_python.exists() {
+            info!(
+                "Creating Qwen3 Python runtime at {} using {}",
+                venv_dir.display(),
+                uv_bin.display()
+            );
+
+            let venv_status = std::process::Command::new(&uv_bin)
+                .arg("venv")
+                .arg("--clear")
+                .arg("--python")
+                .arg("3.11")
+                .arg(&venv_dir)
+                .status()
+                .map_err(|e| anyhow::anyhow!("Failed to execute uv venv: {}", e))?;
+            if !venv_status.success() {
+                return Err(anyhow::anyhow!("uv venv failed with status: {}", venv_status));
+            }
+        } else {
+            info!(
+                "Reusing existing Qwen3 Python runtime at {} and re-running dependency sync",
+                venv_python.display()
+            );
+        }
+
+        let sync_status = std::process::Command::new(&uv_bin)
+            .arg("sync")
+            .arg("--project")
+            .arg(&python_runtime_dir)
+            .arg("--python")
+            .arg(&venv_python)
+            .arg("--frozen")
+            .status()
+            .map_err(|e| anyhow::anyhow!("Failed to execute uv sync: {}", e))?;
+        if !sync_status.success() {
+            return Err(anyhow::anyhow!("uv sync failed with status: {}", sync_status));
+        }
+
+        Ok(())
+    }
+
+    fn sync_dir_if_newer(src: &Path, dst: &Path) -> Result<()> {
+        if !src.exists() || !src.is_dir() {
+            return Ok(());
+        }
+        fs::create_dir_all(dst)?;
+
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let entry_name = entry.file_name();
+            let entry_name_str = entry_name.to_string_lossy();
+            if entry_name_str == ".venv" || entry_name_str == "__pycache__" {
+                continue;
+            }
+            let src_path = entry.path();
+            let dst_path = dst.join(entry_name);
+            let metadata = entry.metadata()?;
+
+            if metadata.is_dir() {
+                Self::sync_dir_if_newer(&src_path, &dst_path)?;
+            } else if metadata.is_file() {
+                let should_copy = if !dst_path.exists() {
+                    true
+                } else {
+                    let src_mtime = src_path.metadata()?.modified()?;
+                    let dst_mtime = dst_path.metadata()?.modified()?;
+                    src_mtime > dst_mtime
+                };
+                if should_copy {
+                    if let Some(parent) = dst_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::copy(&src_path, &dst_path)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn download_file_with_resume<F>(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        target_path: &Path,
+        cancel_flag: &Arc<AtomicBool>,
+        mut on_progress: F,
+    ) -> Result<FileDownloadResult>
+    where
+        F: FnMut(u64, u64),
+    {
+        let mut resume_from = if target_path.exists() {
+            target_path.metadata()?.len()
+        } else {
+            0
+        };
+
+        let mut request = client.get(url);
+        if resume_from > 0 {
+            request = request.header("Range", format!("bytes={}-", resume_from));
+        }
+
+        let mut response = request.send().await?;
+        if resume_from > 0 && response.status() == reqwest::StatusCode::OK {
+            warn!(
+                "Server doesn't support range requests for {}, restarting download",
+                url
+            );
+            drop(response);
+            let _ = fs::remove_file(target_path);
+            resume_from = 0;
+            response = client.get(url).send().await?;
+        }
+
+        if !response.status().is_success()
+            && response.status() != reqwest::StatusCode::PARTIAL_CONTENT
+        {
+            return Err(anyhow::anyhow!(
+                "Failed to download {}: HTTP {}",
+                url,
+                response.status()
+            ));
+        }
+
+        let total_size = if resume_from > 0 {
+            resume_from + response.content_length().unwrap_or(0)
+        } else {
+            response.content_length().unwrap_or(0)
+        };
+
+        let mut downloaded = resume_from;
+        let mut stream = response.bytes_stream();
+
+        let mut file = if resume_from > 0 {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(target_path)?
+        } else {
+            std::fs::File::create(target_path)?
+        };
+
+        on_progress(downloaded, total_size);
+
+        let mut last_emit = Instant::now();
+        let throttle_duration = Duration::from_millis(100);
+
+        while let Some(chunk) = stream.next().await {
+            if cancel_flag.load(Ordering::Relaxed) {
+                drop(file);
+                return Ok(FileDownloadResult {
+                    downloaded,
+                    total: total_size,
+                    cancelled: true,
+                });
+            }
+
+            let chunk = chunk?;
+            file.write_all(&chunk)?;
+            downloaded += chunk.len() as u64;
+
+            if last_emit.elapsed() >= throttle_duration {
+                on_progress(downloaded, total_size);
+                last_emit = Instant::now();
+            }
+        }
+
+        file.flush()?;
+        drop(file);
+
+        on_progress(downloaded, total_size);
+
+        Ok(FileDownloadResult {
+            downloaded,
+            total: total_size,
+            cancelled: false,
+        })
+    }
+
     pub async fn download_model(&self, model_id: &str) -> Result<()> {
         let model_info = {
             let models = self.available_models.lock().unwrap();
@@ -960,6 +1620,12 @@ impl ModelManager {
         let url = model_info
             .url
             .ok_or_else(|| anyhow::anyhow!("No download URL for model"))?;
+
+        // Handle mlx-audio managed models (Qwen3)
+        if url.starts_with("mlx://") {
+            return self.download_mlx_model(model_id).await;
+        }
+
         let model_path = self.models_dir.join(&model_info.filename);
         let partial_path = self
             .models_dir
@@ -976,14 +1642,12 @@ impl ModelManager {
         }
 
         // Check if we have a partial download to resume
-        let mut resume_from = if partial_path.exists() {
+        if partial_path.exists() {
             let size = partial_path.metadata()?.len();
             info!("Resuming download of model {} from byte {}", model_id, size);
-            size
         } else {
             info!("Starting fresh download of model {} from {}", model_id, url);
-            0
-        };
+        }
 
         // Mark as downloading
         {
@@ -1009,135 +1673,32 @@ impl ModelManager {
             disarmed: false,
         };
 
-        // Create HTTP client with range request for resuming
         let client = reqwest::Client::new();
-        let mut request = client.get(&url);
-
-        if resume_from > 0 {
-            request = request.header("Range", format!("bytes={}-", resume_from));
-        }
-
-        let mut response = request.send().await?;
-
-        // If we tried to resume but server returned 200 (not 206 Partial Content),
-        // the server doesn't support range requests. Delete partial file and restart
-        // fresh to avoid file corruption (appending full file to partial).
-        if resume_from > 0 && response.status() == reqwest::StatusCode::OK {
-            warn!(
-                "Server doesn't support range requests for model {}, restarting download",
-                model_id
-            );
-            drop(response);
-            let _ = fs::remove_file(&partial_path);
-
-            // Reset resume_from since we're starting fresh
-            resume_from = 0;
-
-            // Restart download without range header
-            response = client.get(&url).send().await?;
-        }
-
-        // Check for success or partial content status
-        if !response.status().is_success()
-            && response.status() != reqwest::StatusCode::PARTIAL_CONTENT
-        {
-            return Err(anyhow::anyhow!(
-                "Failed to download model: HTTP {}",
-                response.status()
-            ));
-        }
-
-        let total_size = if resume_from > 0 {
-            // For resumed downloads, add the resume point to content length
-            resume_from + response.content_length().unwrap_or(0)
-        } else {
-            response.content_length().unwrap_or(0)
-        };
-
-        let mut downloaded = resume_from;
-        let mut stream = response.bytes_stream();
-
-        // Open file for appending if resuming, or create new if starting fresh
-        let mut file = if resume_from > 0 {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&partial_path)?
-        } else {
-            std::fs::File::create(&partial_path)?
-        };
-
-        // Emit initial progress
-        let initial_progress = DownloadProgress {
-            model_id: model_id.to_string(),
-            downloaded,
-            total: total_size,
-            percentage: if total_size > 0 {
-                (downloaded as f64 / total_size as f64) * 100.0
-            } else {
-                0.0
-            },
-        };
-        let _ = self
-            .app_handle
-            .emit("model-download-progress", &initial_progress);
-
-        // Throttle progress events to max 10/sec (100ms intervals)
-        let mut last_emit = Instant::now();
-        let throttle_duration = Duration::from_millis(100);
-
-        // Download with progress
-        while let Some(chunk) = stream.next().await {
-            // Check if download was cancelled
-            if cancel_flag.load(Ordering::Relaxed) {
-                drop(file);
-                info!("Download cancelled for: {}", model_id);
-                // Keep partial file for resume functionality.
-                // Guard handles is_downloading + cancel_flags cleanup on drop.
-                return Ok(());
-            }
-
-            let chunk = chunk?;
-
-            file.write_all(&chunk)?;
-            downloaded += chunk.len() as u64;
-
-            let percentage = if total_size > 0 {
-                (downloaded as f64 / total_size as f64) * 100.0
-            } else {
-                0.0
-            };
-
-            // Emit progress event (throttled to avoid UI freeze)
-            if last_emit.elapsed() >= throttle_duration {
-                let progress = DownloadProgress {
-                    model_id: model_id.to_string(),
-                    downloaded,
-                    total: total_size,
-                    percentage,
+        let download_result = self
+            .download_file_with_resume(&client, &url, &partial_path, &cancel_flag, |downloaded, total_size| {
+                let percentage = if total_size > 0 {
+                    (downloaded as f64 / total_size as f64) * 100.0
+                } else {
+                    0.0
                 };
-                let _ = self.app_handle.emit("model-download-progress", &progress);
-                last_emit = Instant::now();
-            }
+                let _ = self.app_handle.emit(
+                    "model-download-progress",
+                    DownloadProgress {
+                        model_id: model_id.to_string(),
+                        downloaded,
+                        total: total_size,
+                        percentage,
+                    },
+                );
+            })
+            .await?;
+
+        if download_result.cancelled {
+            info!("Download cancelled for: {}", model_id);
+            return Ok(());
         }
 
-        // Emit final progress to ensure 100% is shown
-        let final_progress = DownloadProgress {
-            model_id: model_id.to_string(),
-            downloaded,
-            total: total_size,
-            percentage: if total_size > 0 {
-                (downloaded as f64 / total_size as f64) * 100.0
-            } else {
-                100.0
-            },
-        };
-        let _ = self
-            .app_handle
-            .emit("model-download-progress", &final_progress);
-
-        file.flush()?;
-        drop(file); // Ensure file is closed before moving
+        let total_size = download_result.total;
 
         // Verify downloaded file size matches expected size
         if total_size > 0 {
@@ -1301,6 +1862,13 @@ impl ModelManager {
 
         debug!("ModelManager: Found model info: {:?}", model_info);
 
+        // Handle mlx-audio managed models (Qwen3)
+        if let Some(url) = &model_info.url {
+            if url.starts_with("mlx://") {
+                return self.delete_mlx_model(model_id);
+            }
+        }
+
         let model_path = self.models_dir.join(&model_info.filename);
         let partial_path = self
             .models_dir
@@ -1373,6 +1941,20 @@ impl ModelManager {
                 "Model is currently downloading: {}",
                 model_id
             ));
+        }
+
+        // Handle mlx-audio managed models (Qwen3)
+        if let Some(url) = &model_info.url {
+            if url.starts_with("mlx://") {
+                let local_model_dir = self.local_mlx_model_dir(model_id)?;
+                if local_model_dir.exists() && local_model_dir.is_dir() {
+                    return Ok(local_model_dir);
+                }
+                let mlx_model_name = self
+                    .mlx_model_name_for(model_id)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown mlx-audio model: {}", model_id))?;
+                return Ok(PathBuf::from(format!("mlx://{}", mlx_model_name)));
+            }
         }
 
         let model_path = self.models_dir.join(&model_info.filename);

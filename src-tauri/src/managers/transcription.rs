@@ -1,6 +1,7 @@
 use crate::audio_toolkit::{apply_custom_words, filter_transcription_output};
 use crate::managers::audio::AudioRecordingManager;
 use crate::managers::model::{EngineType, ModelManager};
+use crate::managers::qwen3_engine::{init_qwen3_python_path, Qwen3Engine, Qwen3InferenceParams};
 use crate::settings::{
     get_settings, ModelUnloadTimeout, OrtAcceleratorSetting, WhisperAcceleratorSetting,
 };
@@ -43,6 +44,7 @@ enum LoadedEngine {
     SenseVoice(SenseVoiceModel),
     GigaAM(GigaAMModel),
     Canary(CanaryModel),
+    Qwen3(Qwen3Engine),
 }
 
 /// RAII guard that clears the `is_loading` flag and notifies waiters on drop.
@@ -196,6 +198,9 @@ impl TranscriptionManager {
 
         {
             let mut engine = self.lock_engine();
+            if let Some(LoadedEngine::Qwen3(ref mut qwen3_engine)) = *engine {
+                qwen3_engine.unload_model();
+            }
             // Dropping the engine frees all resources
             *engine = None;
         }
@@ -366,6 +371,36 @@ impl TranscriptionManager {
                     anyhow::anyhow!(error_msg)
                 })?;
                 LoadedEngine::Canary(engine)
+            }
+            EngineType::Qwen3 => {
+                self.model_manager
+                    .ensure_qwen3_python_runtime_ready(None)
+                    .map_err(|e| {
+                        let error_msg = format!("Failed to prepare Qwen3 Python runtime: {}", e);
+                        emit_loading_failed(&error_msg);
+                        anyhow::anyhow!(error_msg)
+                    })?;
+                init_qwen3_python_path(&self.app_handle).map_err(|e| {
+                    let error_msg = format!("Failed to initialize Qwen3 Python path: {}", e);
+                    emit_loading_failed(&error_msg);
+                    anyhow::anyhow!(error_msg)
+                })?;
+                let mut engine = Qwen3Engine::new();
+                let model_ref = model_path
+                    .to_string_lossy()
+                    .trim_start_matches("mlx://")
+                    .to_string();
+                if model_ref.is_empty() {
+                    let error_msg = format!("Invalid Qwen3 model reference for {}", model_id);
+                    emit_loading_failed(&error_msg);
+                    return Err(anyhow::anyhow!(error_msg));
+                }
+                engine.load_model(&model_ref).map_err(|e| {
+                    let error_msg = format!("Failed to load Qwen3 model {}: {}", model_id, e);
+                    emit_loading_failed(&error_msg);
+                    anyhow::anyhow!(error_msg)
+                })?;
+                LoadedEngine::Qwen3(engine)
             }
         };
 
@@ -599,6 +634,22 @@ impl TranscriptionManager {
                             canary_engine
                                 .transcribe(&audio, &options)
                                 .map_err(|e| anyhow::anyhow!("Canary transcription failed: {}", e))
+                        }
+                        LoadedEngine::Qwen3(qwen3_engine) => {
+                            let params = Qwen3InferenceParams {
+                                language: if validated_language == "auto" {
+                                    None
+                                } else {
+                                    Some(validated_language.clone())
+                                },
+                            };
+                            let result = qwen3_engine
+                                .transcribe_samples(audio, Some(params))
+                                .map_err(|e| anyhow::anyhow!("Qwen3 transcription failed: {}", e))?;
+                            Ok(transcribe_rs::TranscriptionResult {
+                                text: result.text,
+                                segments: None,
+                            })
                         }
                     }
                 },
