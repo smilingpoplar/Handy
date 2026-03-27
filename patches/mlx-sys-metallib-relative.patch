@@ -1,0 +1,23 @@
+diff --git a/mlx-rs/mlx-sys/build.rs b/mlx-rs/mlx-sys/build.rs
+index 2e4f42f..7fd1362 100644
+--- a/mlx-rs/mlx-sys/build.rs
++++ b/mlx-rs/mlx-sys/build.rs
+@@ -215,6 +215,18 @@ auto get_metal_version() {
+                     }
+                 }
+             }
++
++            // Fix metallib lookup for macOS app bundle layout:
++            // Contents/MacOS + ../Resources/mlx.metallib
++            if content.contains("load_colocated_library(device, \"Resources/mlx\")")
++                && !content.contains("load_colocated_library(device, \"../Resources/mlx\")")
++            {
++                let patched = content.replace(
++                    "load_colocated_library(device, \"Resources/mlx\")",
++                    "load_colocated_library(device, \"../Resources/mlx\")",
++                );
++                let _ = fs::write(&device_cpp, patched);
++            }
+         }
+     }
+ 

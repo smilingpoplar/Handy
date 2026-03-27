@@ -1,4 +1,8 @@
 fn main() {
+    cfg_aliases::cfg_aliases! {
+        mlx: { all(feature = "mlx", target_os = "macos", target_arch = "aarch64") },
+    }
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     build_apple_intelligence_bridge();
 

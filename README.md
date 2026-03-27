@@ -1,3 +1,17 @@
+# 本Fork更新
+
+集成[rs版的qwen3-asr-mlx](https://github.com/OminiX-ai/OminiX-MLX/tree/main/qwen3-asr-mlx)
+
+- 添加mac的mlx模型：[Qwen3-ASR-0.6B-8bit](https://huggingface.co/mlx-community/Qwen3-ASR-0.6B-8bit)、[Qwen3-ASR-1.7B-8bit](https://huggingface.co/mlx-community/Qwen3-ASR-1.7B-8bit)
+- 加快上述模型的第一次转录
+
+```
+bun run mlx:dev    # 开发
+bun run mlx:build  # 打包
+```
+
+---
+
 # Handy
 
 [![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?style=for-the-badge&logo=discord&logoColor=white)](https://discord.com/invite/WVBeWsNXK4)

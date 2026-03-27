@@ -8,6 +8,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "mlx:build": "./scripts/mlx_build.sh",
+    "mlx:dev": "tauri dev --config src-tauri/tauri.mlx.conf.json",
     "lint": "eslint src",
     "lint:fix": "eslint src --fix",
     "format": "prettier --write . && cd src-tauri && cargo fmt",

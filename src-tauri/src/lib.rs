@@ -28,6 +28,8 @@ use tauri_specta::{collect_commands, collect_events, Builder};
 use env_filter::Builder as EnvFilterBuilder;
 use managers::audio::AudioRecordingManager;
 use managers::history::HistoryManager;
+#[cfg(mlx)]
+use managers::model::EngineType;
 use managers::model::ModelManager;
 use managers::transcription::TranscriptionManager;
 #[cfg(unix)]
@@ -292,6 +294,29 @@ fn initialize_core_logic(app_handle: &AppHandle) {
 
     // Create the recording overlay window (hidden by default)
     utils::create_recording_overlay(app_handle);
+}
+
+#[cfg(mlx)]
+pub(crate) fn schedule_qwen3_startup_preload(app_handle: AppHandle) {
+    std::thread::spawn(move || {
+        let model_manager = app_handle.state::<Arc<ModelManager>>();
+        let transcription_manager = app_handle.state::<Arc<TranscriptionManager>>();
+        let settings = settings::get_settings(&app_handle);
+        let selected = settings.selected_model;
+
+        if let Some(info) = model_manager.get_model_info(&selected) {
+            if info.is_downloaded
+                && matches!(info.engine_type, EngineType::Qwen3ASR)
+                && managers::qwen3asr_mlx::is_available()
+            {
+                log::info!(
+                    "Deferred startup preload for selected Qwen3ASR model: {}",
+                    selected
+                );
+                transcription_manager.initiate_model_load();
+            }
+        }
+    });
 }
 
 #[tauri::command]
@@ -598,6 +623,10 @@ pub fn run(cli_args: CliArgs) {
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = &event {
                 show_main_window(app);
+            }
+            #[cfg(mlx)]
+            if let tauri::RunEvent::Ready = &event {
+                schedule_qwen3_startup_preload(app.clone());
             }
             let _ = (app, event); // suppress unused warnings on non-macOS
         });

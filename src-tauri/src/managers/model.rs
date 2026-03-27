@@ -17,6 +17,9 @@ use std::time::{Duration, Instant};
 use tar::Archive;
 use tauri::{AppHandle, Emitter, Manager};
 
+#[cfg(mlx)]
+mod qwen3asr;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub enum EngineType {
     Whisper,
@@ -27,6 +30,7 @@ pub enum EngineType {
     GigaAM,
     Canary,
     Cohere,
+    Qwen3ASR,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -58,6 +62,12 @@ pub struct DownloadProgress {
     pub downloaded: u64,
     pub total: u64,
     pub percentage: f64,
+}
+
+struct FileDownloadResult {
+    downloaded: u64,
+    total: u64,
+    cancelled: bool,
 }
 
 /// RAII guard that cleans up download state (`is_downloading` flag and cancel flag)
@@ -254,11 +264,14 @@ impl ModelManager {
                 speed_score: 0.35,
                 supports_translation: false,
                 is_recommended: false,
-                supported_languages: whisper_languages,
+                supported_languages: whisper_languages.clone(),
                 supports_language_selection: true,
                 is_custom: false,
             },
         );
+
+        #[cfg(mlx)]
+        qwen3asr::insert_models(&mut available_models);
 
         // Add NVIDIA Parakeet models (directory-based)
         available_models.insert(
@@ -721,8 +734,18 @@ impl ModelManager {
 
     fn update_download_status(&self) -> Result<()> {
         let mut models = self.available_models.lock().unwrap();
+        #[cfg(mlx)]
+        self.refresh_mlx_download_status(&mut models);
 
         for model in models.values_mut() {
+            if model
+                .url
+                .as_deref()
+                .is_some_and(|url| url.starts_with("mlx://"))
+            {
+                continue;
+            }
+
             if model.is_directory {
                 // For directory-based models, check if the directory exists
                 let model_path = self.models_dir.join(&model.filename);
@@ -984,6 +1007,105 @@ impl ModelManager {
         Ok(format!("{:x}", hasher.finalize()))
     }
 
+    async fn download_file_with_resume<F>(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        target_path: &Path,
+        cancel_flag: &Arc<AtomicBool>,
+        mut on_progress: F,
+    ) -> Result<FileDownloadResult>
+    where
+        F: FnMut(u64, u64),
+    {
+        let mut resume_from = if target_path.exists() {
+            target_path.metadata()?.len()
+        } else {
+            0
+        };
+
+        let mut request = client.get(url);
+        if resume_from > 0 {
+            request = request.header("Range", format!("bytes={}-", resume_from));
+        }
+
+        let mut response = request.send().await?;
+        if resume_from > 0 && response.status() == reqwest::StatusCode::OK {
+            warn!(
+                "Server doesn't support range requests for {}, restarting download",
+                url
+            );
+            drop(response);
+            let _ = fs::remove_file(target_path);
+            resume_from = 0;
+            response = client.get(url).send().await?;
+        }
+
+        if !response.status().is_success()
+            && response.status() != reqwest::StatusCode::PARTIAL_CONTENT
+        {
+            return Err(anyhow::anyhow!(
+                "Failed to download {}: HTTP {}",
+                url,
+                response.status()
+            ));
+        }
+
+        let total_size = if resume_from > 0 {
+            resume_from + response.content_length().unwrap_or(0)
+        } else {
+            response.content_length().unwrap_or(0)
+        };
+
+        let mut downloaded = resume_from;
+        let mut stream = response.bytes_stream();
+
+        let mut file = if resume_from > 0 {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(target_path)?
+        } else {
+            std::fs::File::create(target_path)?
+        };
+
+        on_progress(downloaded, total_size);
+
+        let mut last_emit = Instant::now();
+        let throttle_duration = Duration::from_millis(100);
+
+        while let Some(chunk) = stream.next().await {
+            if cancel_flag.load(Ordering::Relaxed) {
+                drop(file);
+                return Ok(FileDownloadResult {
+                    downloaded,
+                    total: total_size,
+                    cancelled: true,
+                });
+            }
+
+            let chunk = chunk?;
+            file.write_all(&chunk)?;
+            downloaded += chunk.len() as u64;
+
+            if last_emit.elapsed() >= throttle_duration {
+                on_progress(downloaded, total_size);
+                last_emit = Instant::now();
+            }
+        }
+
+        file.flush()?;
+        drop(file);
+
+        on_progress(downloaded, total_size);
+
+        Ok(FileDownloadResult {
+            downloaded,
+            total: total_size,
+            cancelled: false,
+        })
+    }
+
     pub async fn download_model(&self, model_id: &str) -> Result<()> {
         let model_info = {
             let models = self.available_models.lock().unwrap();
@@ -996,6 +1118,12 @@ impl ModelManager {
         let url = model_info
             .url
             .ok_or_else(|| anyhow::anyhow!("No download URL for model"))?;
+
+        #[cfg(mlx)]
+        if self.try_download_mlx_model(model_id, &url).await? {
+            return Ok(());
+        }
+
         let model_path = self.models_dir.join(&model_info.filename);
         let partial_path = self
             .models_dir
@@ -1012,14 +1140,12 @@ impl ModelManager {
         }
 
         // Check if we have a partial download to resume
-        let mut resume_from = if partial_path.exists() {
+        if partial_path.exists() {
             let size = partial_path.metadata()?.len();
             info!("Resuming download of model {} from byte {}", model_id, size);
-            size
         } else {
             info!("Starting fresh download of model {} from {}", model_id, url);
-            0
-        };
+        }
 
         // Mark as downloading
         {
@@ -1045,135 +1171,43 @@ impl ModelManager {
             disarmed: false,
         };
 
-        // Create HTTP client with range request for resuming
         let client = reqwest::Client::new();
-        let mut request = client.get(&url);
+        let download_result = self
+            .download_file_with_resume(
+                &client,
+                &url,
+                &partial_path,
+                &cancel_flag,
+                |downloaded, total_size| {
+                    let percentage = if total_size > 0 {
+                        (downloaded as f64 / total_size as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    let _ = self.app_handle.emit(
+                        "model-download-progress",
+                        DownloadProgress {
+                            model_id: model_id.to_string(),
+                            downloaded,
+                            total: total_size,
+                            percentage,
+                        },
+                    );
+                },
+            )
+            .await?;
 
-        if resume_from > 0 {
-            request = request.header("Range", format!("bytes={}-", resume_from));
+        if download_result.cancelled {
+            info!("Download cancelled for: {}", model_id);
+            return Ok(());
         }
 
-        let mut response = request.send().await?;
-
-        // If we tried to resume but server returned 200 (not 206 Partial Content),
-        // the server doesn't support range requests. Delete partial file and restart
-        // fresh to avoid file corruption (appending full file to partial).
-        if resume_from > 0 && response.status() == reqwest::StatusCode::OK {
-            warn!(
-                "Server doesn't support range requests for model {}, restarting download",
-                model_id
-            );
-            drop(response);
-            let _ = fs::remove_file(&partial_path);
-
-            // Reset resume_from since we're starting fresh
-            resume_from = 0;
-
-            // Restart download without range header
-            response = client.get(&url).send().await?;
-        }
-
-        // Check for success or partial content status
-        if !response.status().is_success()
-            && response.status() != reqwest::StatusCode::PARTIAL_CONTENT
-        {
-            return Err(anyhow::anyhow!(
-                "Failed to download model: HTTP {}",
-                response.status()
-            ));
-        }
-
-        let total_size = if resume_from > 0 {
-            // For resumed downloads, add the resume point to content length
-            resume_from + response.content_length().unwrap_or(0)
-        } else {
-            response.content_length().unwrap_or(0)
-        };
-
-        let mut downloaded = resume_from;
-        let mut stream = response.bytes_stream();
-
-        // Open file for appending if resuming, or create new if starting fresh
-        let mut file = if resume_from > 0 {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&partial_path)?
-        } else {
-            std::fs::File::create(&partial_path)?
-        };
-
-        // Emit initial progress
-        let initial_progress = DownloadProgress {
-            model_id: model_id.to_string(),
-            downloaded,
-            total: total_size,
-            percentage: if total_size > 0 {
-                (downloaded as f64 / total_size as f64) * 100.0
-            } else {
-                0.0
-            },
-        };
-        let _ = self
-            .app_handle
-            .emit("model-download-progress", &initial_progress);
-
-        // Throttle progress events to max 10/sec (100ms intervals)
-        let mut last_emit = Instant::now();
-        let throttle_duration = Duration::from_millis(100);
-
-        // Download with progress
-        while let Some(chunk) = stream.next().await {
-            // Check if download was cancelled
-            if cancel_flag.load(Ordering::Relaxed) {
-                drop(file);
-                info!("Download cancelled for: {}", model_id);
-                // Keep partial file for resume functionality.
-                // Guard handles is_downloading + cancel_flags cleanup on drop.
-                return Ok(());
-            }
-
-            let chunk = chunk?;
-
-            file.write_all(&chunk)?;
-            downloaded += chunk.len() as u64;
-
-            let percentage = if total_size > 0 {
-                (downloaded as f64 / total_size as f64) * 100.0
-            } else {
-                0.0
-            };
-
-            // Emit progress event (throttled to avoid UI freeze)
-            if last_emit.elapsed() >= throttle_duration {
-                let progress = DownloadProgress {
-                    model_id: model_id.to_string(),
-                    downloaded,
-                    total: total_size,
-                    percentage,
-                };
-                let _ = self.app_handle.emit("model-download-progress", &progress);
-                last_emit = Instant::now();
-            }
-        }
-
-        // Emit final progress to ensure 100% is shown
-        let final_progress = DownloadProgress {
-            model_id: model_id.to_string(),
-            downloaded,
-            total: total_size,
-            percentage: if total_size > 0 {
-                (downloaded as f64 / total_size as f64) * 100.0
-            } else {
-                100.0
-            },
-        };
-        let _ = self
-            .app_handle
-            .emit("model-download-progress", &final_progress);
-
-        file.flush()?;
-        drop(file); // Ensure file is closed before moving
+        let downloaded_size = download_result.downloaded;
+        let total_size = download_result.total;
+        debug!(
+            "Download finished for {}: downloaded={} total={}",
+            model_id, downloaded_size, total_size
+        );
 
         // Verify downloaded file size matches expected size
         if total_size > 0 {
@@ -1337,6 +1371,11 @@ impl ModelManager {
 
         debug!("ModelManager: Found model info: {:?}", model_info);
 
+        #[cfg(mlx)]
+        if self.try_delete_mlx_model(model_id, &model_info)? {
+            return Ok(());
+        }
+
         let model_path = self.models_dir.join(&model_info.filename);
         let partial_path = self
             .models_dir
@@ -1409,6 +1448,11 @@ impl ModelManager {
                 "Model is currently downloading: {}",
                 model_id
             ));
+        }
+
+        #[cfg(mlx)]
+        if let Some(path) = self.try_get_mlx_model_path(model_id, &model_info)? {
+            return Ok(path);
         }
 
         let model_path = self.models_dir.join(&model_info.filename);

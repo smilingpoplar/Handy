@@ -1,6 +1,8 @@
 use crate::audio_toolkit::{apply_custom_words, filter_transcription_output};
 use crate::managers::audio::AudioRecordingManager;
 use crate::managers::model::{EngineType, ModelManager};
+#[cfg(mlx)]
+use crate::managers::qwen3asr_mlx::{Qwen3ASR, Qwen3ASRInferenceParams};
 use crate::settings::{
     get_settings, ModelUnloadTimeout, OrtAcceleratorSetting, WhisperAcceleratorSetting,
 };
@@ -45,6 +47,8 @@ enum LoadedEngine {
     GigaAM(GigaAMModel),
     Canary(CanaryModel),
     Cohere(CohereModel),
+    #[cfg(mlx)]
+    Qwen3ASR(Qwen3ASR),
 }
 
 /// RAII guard that clears the `is_loading` flag and notifies waiters on drop.
@@ -284,8 +288,6 @@ impl TranscriptionManager {
             return Err(anyhow::anyhow!(error_msg));
         }
 
-        let model_path = self.model_manager.get_model_path(model_id)?;
-
         // Create appropriate engine based on model type
         let emit_loading_failed = |error_msg: &str| {
             let _ = self.app_handle.emit(
@@ -298,6 +300,12 @@ impl TranscriptionManager {
                 },
             );
         };
+
+        let model_path = self.model_manager.get_model_path(model_id).map_err(|e| {
+            let error_msg = format!("Failed to resolve model path for {}: {}", model_id, e);
+            emit_loading_failed(&error_msg);
+            anyhow::anyhow!(error_msg)
+        })?;
 
         let loaded_engine = match model_info.engine_type {
             EngineType::Whisper => {
@@ -376,6 +384,39 @@ impl TranscriptionManager {
                     anyhow::anyhow!(error_msg)
                 })?;
                 LoadedEngine::Cohere(engine)
+            }
+            EngineType::Qwen3ASR => {
+                #[cfg(not(mlx))]
+                {
+                    let error_msg =
+                        format!("Qwen3ASR is only available in mlx builds ({})", model_id);
+                    emit_loading_failed(&error_msg);
+                    return Err(anyhow::anyhow!(error_msg));
+                }
+
+                #[cfg(mlx)]
+                {
+                    let mut engine = Qwen3ASR::new();
+                    let model_ref = model_info
+                        .url
+                        .as_deref()
+                        .unwrap_or_default()
+                        .trim_start_matches("mlx://")
+                        .to_string();
+                    if model_ref.is_empty() {
+                        let error_msg =
+                            format!("Invalid Qwen3ASR model reference for {}", model_id);
+                        emit_loading_failed(&error_msg);
+                        return Err(anyhow::anyhow!(error_msg));
+                    }
+                    engine.load_model(&model_ref, &model_path).map_err(|e| {
+                        let error_msg =
+                            format!("Failed to load Qwen3ASR model {}: {}", model_id, e);
+                        emit_loading_failed(&error_msg);
+                        anyhow::anyhow!(error_msg)
+                    })?;
+                    LoadedEngine::Qwen3ASR(engine)
+                }
             }
         };
 
@@ -628,6 +669,25 @@ impl TranscriptionManager {
                             cohere_engine
                                 .transcribe(&audio, &options)
                                 .map_err(|e| anyhow::anyhow!("Cohere transcription failed: {}", e))
+                        }
+                        #[cfg(mlx)]
+                        LoadedEngine::Qwen3ASR(qwen3asr) => {
+                            let params =
+                                Qwen3ASRInferenceParams::new(if validated_language == "auto" {
+                                    None
+                                } else {
+                                    Some(validated_language.clone())
+                                });
+                            let result =
+                                qwen3asr
+                                    .transcribe_samples(audio, Some(params))
+                                    .map_err(|e| {
+                                        anyhow::anyhow!("Qwen3ASR transcription failed: {}", e)
+                                    })?;
+                            Ok(transcribe_rs::TranscriptionResult {
+                                text: result.text,
+                                segments: None,
+                            })
                         }
                     }
                 },
