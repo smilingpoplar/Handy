@@ -1,0 +1,11 @@
+[project]
+name = "handy-qwen3-runtime"
+version = "0.1.0"
+description = "Pinned Python runtime dependencies for Handy Qwen3 ASR engine"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "mlx-audio==0.4.1",
+]
+
+[tool.uv]
+package = false

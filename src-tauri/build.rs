@@ -1,4 +1,7 @@
 fn main() {
+    // Ensure Cargo reruns build script when Qwen3 runtime resources change.
+    println!("cargo:rerun-if-changed=resources/qwen3asr_mlx");
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     build_apple_intelligence_bridge();
 
