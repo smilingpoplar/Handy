@@ -1,0 +1,14 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "macOS": {
+      "frameworks": [
+        "./target/qwen3asr_bridge/libHandyQwen3ASRBridge.dylib",
+        "./target/qwen3asr_bridge/libswiftCompatibilitySpan.dylib"
+      ],
+      "files": {
+        "Frameworks/mlx.metallib": "./target/qwen3asr_bridge/mlx.metallib"
+      }
+    }
+  }
+}

@@ -8,6 +8,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "mlx:dev": "HANDY_BUILD_QWEN3ASR_MLX=1 tauri dev --config src-tauri/tauri.macos.mlx.conf.json",
+    "mlx:build": "HANDY_BUILD_QWEN3ASR_MLX=1 tauri build --config src-tauri/tauri.macos.mlx.conf.json",
     "lint": "eslint src",
     "lint:fix": "eslint src --fix",
     "format": "prettier --write . && cd src-tauri && cargo fmt",

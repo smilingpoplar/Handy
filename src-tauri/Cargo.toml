@@ -27,6 +27,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
 
 [dependencies]
 once_cell = "1"
@@ -59,12 +60,15 @@ vad-rs = { git = "https://github.com/cjpais/vad-rs", default-features = false }
 enigo = "0.6.1"
 rodio = { git = "https://github.com/cjpais/rodio.git" }
 reqwest = { version = "0.12", features = ["json", "stream"] }
+hf-hub = { version = "0.5.0", default-features = false, features = ["ureq", "native-tls"] }
 futures-util = "0.3"
+libloading = "0.8"
 rustfft = "6.4.0"
 strsim = "0.11.0"
 natural = "0.5.0"
 regex = "1"
 chrono = "0.4"
+os_info = "3.14.0"
 rusqlite = { version = "0.37", features = ["bundled"] }
 tar = "0.4.44"
 flate2 = "1.0"
